@@ -1,6 +1,6 @@
 # ADR 0001: Durable deep-research CLI
 
-- **Status:** Accepted and implemented in this workspace
+- **Status:** CLI-first implementation accepted; transport boundary superseded by ADR 0002
 - **Date:** 2026-03-19
 
 ## Context

@@ -1,0 +1,5 @@
+# ADR 0002: Transport-independent ResearchRunAgent
+
+- **Status:** Accepted and implemented in this workspace
+
+Expose research-run lifecycle through a transport-independent `ResearchRunAgent` service so the CLI and future in-process or remote clients use the same contract. The service keeps the current environment-based internal configuration and is single-tenant initially; callers can discover agents, start/list/get/watch runs, answer clarifications, and resume the same run. `start` returns after durable acceptance while execution continues independently, and service startup recovers saved running runs. Resume is idempotent and reattaches to or recovers nonterminal work; it does not restart completed or failed runs, and clarification-paused runs require an explicit answer. Progress is exposed at stable, high-level run phases; individual researcher/task events, Durable task IDs, and task-graph details remain internal.

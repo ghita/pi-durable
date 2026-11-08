@@ -1,6 +1,6 @@
-# Durable Deep Research CLI
+# Durable Deep Research Agent
 
-A small command-line deep-research workflow built with `@earendil-works/pi-durable`. The workflow keeps the research supervisor deterministic, while each researcher uses Durable's built-in conversation/tool loop.
+A durable deep-research workflow built with `@earendil-works/pi-durable`, exposed as an in-process `ResearchRunAgent` service and a CLI adapter. The workflow keeps the research supervisor deterministic, while each researcher uses Durable's built-in conversation/tool loop.
 
 ## Requirements and setup
 
@@ -24,7 +24,7 @@ Start one run (the request is the positional argument):
 npm run cli -- "Research current battery recycling methods"
 ```
 
-The CLI prints a run ID before starting, shows progress on stderr, and writes the final Markdown report to stdout. If clarification is needed, it asks in the terminal. Ctrl-C leaves the saved run resumable.
+The CLI prints the durable run ID, shows high-level progress on stderr, and writes the final Markdown report to stdout. If clarification is needed, it asks in the terminal. Ctrl-C leaves the saved run resumable.
 
 ```sh
 npm run cli -- resume <run-id>
@@ -35,13 +35,43 @@ npm run cli -- list
 
 For an installed executable, run `npm link` after `npm run build`, then use `deep-research "..."`, `deep-research resume <run-id>`, or `deep-research list`.
 
+## In-process service
+
+The CLI uses the same service contract available to an in-process host. `createResearchRunAgent()` reads the existing environment-based configuration internally and recovers saved running runs when opened.
+
+```ts
+import { createResearchRunAgent } from "deep-research-durable-cli";
+
+const agent = await createResearchRunAgent();
+try {
+  const [deepResearch] = await agent.listAgents();
+  const run = await agent.start({
+    agentId: deepResearch!.id,
+    request: "Research current battery recycling methods",
+  });
+
+  let snapshot = run;
+  while (true) {
+    for await (const update of agent.watch(run.runId)) snapshot = update;
+    if (snapshot.status !== "awaiting_clarification") break;
+    // Obtain an answer from the host UI, then continue the same run.
+    snapshot = await agent.answerClarification(run.runId, "Focus on Europe.");
+  }
+  if (snapshot.status === "completed") console.log(snapshot.report);
+} finally {
+  await agent.close();
+}
+```
+
+`start` returns after the run is durably accepted; work continues independently of the caller's connection. `watch` yields high-level run snapshots, and ends when clarification is needed or the run reaches a terminal state. `resume(runId)` reattaches to or recovers the same run; it does not retry completed or failed runs. `close()` waits for active runs to settle. HTTP/IPC adapters are not included yet.
+
 ## Persistence and privacy
 
 Each run gets an isolated SQLite database under `.deep-research/runs/<run-id>.sqlite`. The directory is git-ignored; it contains the prompt, clarification answers, findings, sources, task checkpoints, and report. Keep it local and protect it as user data. SQLite-backed Durable state survives ordinary process exits/crashes; a request interrupted inside an LLM call may be retried on resume.
 
 ## Configuration
 
-Configuration is environment-based to match the existing research agent. `.env` is loaded automatically.
+Configuration is environment-based to match the existing research agent. The CLI loads `.env` automatically; an in-process or server host should populate `process.env` before creating the service.
 
 - Provider/model: `MODEL_PROVIDER` (`openai`, `openrouter`, or `github-copilot`), `OPENAI_MODEL`, `OPENROUTER_MODEL`, or `COPILOT_MODEL`.
 - Provider credentials: `OPENAI_API_KEY`, `OPENROUTER_API_KEY`, or `COPILOT_GITHUB_TOKEN`. Copilot OAuth can reuse the existing `COPILOT_AUTH_FILE` credential file; otherwise the default is `%APPDATA%/ui-react/copilot-auth.json` on Windows or `$XDG_CONFIG_HOME/ui-react/copilot-auth.json` on Unix-like systems.

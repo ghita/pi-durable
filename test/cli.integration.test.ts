@@ -7,7 +7,8 @@ import { BACKGROUND_CONTEXT } from "@earendil-works/chord/context";
 import type { AssistantMessage } from "@earendil-works/pi-ai";
 import { createModels } from "@earendil-works/pi-ai/models";
 import { fauxAssistantMessage, fauxProvider, fauxText, fauxToolCall, type FauxResponseFactory, type FauxResponseStep } from "@earendil-works/pi-ai/providers/faux";
-import { runCli } from "../src/cli.ts";
+import { runCli } from "../src/cli-adapter.ts";
+import { createResearchRunAgent } from "../src/research-run-agent.ts";
 
 type SearchSource = { title: string; url: string; content: string; query: string };
 type Search = (query: string) => Promise<{ ok: true; results: SearchSource[] }>;
@@ -27,20 +28,26 @@ function dependencies(
   let stdout = "";
   let stderr = "";
   const questions: string[] = [];
+  let agentPromise: ReturnType<typeof createResearchRunAgent> | undefined;
+  const getAgent = () => agentPromise ??= createResearchRunAgent({
+    cwd: directory,
+    context: BACKGROUND_CONTEXT,
+    models,
+    model: { provider: "faux", modelId: "faux-1" },
+    search: (query) => search(query),
+    searchConfigured,
+    env,
+  });
   return {
     models,
     faux,
     questions,
+    getAgent,
     get stdout() { return stdout; },
     get stderr() { return stderr; },
-    run: (args: string[], answer = defaultAnswer) => runCli(args, {
-      cwd: directory,
-      context: BACKGROUND_CONTEXT,
-      models,
-      model: { provider: "faux", modelId: "faux-1" },
-      search: (query) => search(query),
-      searchConfigured,
-      env,
+    close: async () => { if (agentPromise) await (await agentPromise).close(); },
+    run: async (args: string[], answer = defaultAnswer) => runCli(args, {
+      agent: await getAgent(),
       io: {
         stdout: (text) => { stdout += text; },
         stderr: (text) => { stderr += text; },
@@ -60,6 +67,33 @@ const directReportResponses = [
   "# Battery recycling\n\nHere is the report.",
 ];
 
+test("ResearchRunAgent accepts work asynchronously and watches high-level progress", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "deep-research-agent-api-"));
+  const app = dependencies(directory, directReportResponses);
+  try {
+    const agent = await app.getAgent();
+    const agents = await agent.listAgents();
+    assert.equal(agents[0]?.id, "deep-research");
+
+    const started = await agent.start({ agentId: agents[0]!.id, request: "Research current battery recycling methods" });
+    assert.equal(started.status, "running");
+    assert.equal(started.request, "Research current battery recycling methods");
+
+    const resumed = await agent.resume(started.runId);
+    assert.equal(resumed.runId, started.runId);
+    const updates = [];
+    for await (const snapshot of agent.watch(started.runId)) updates.push(snapshot);
+    const completed = updates.at(-1);
+    assert.equal(completed?.status, "completed");
+    assert.match(completed?.report ?? "", /# Battery recycling/);
+    assert.ok(updates.some((snapshot) => snapshot.phase === "writing_report"));
+    assert.ok(updates.every((snapshot) => !["supervise", "compress", "report"].includes(snapshot.phase ?? "")));
+  } finally {
+    await app.close();
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
 test("a positional request runs research, prints a run ID, and writes the report", async () => {
   const directory = await mkdtemp(join(tmpdir(), "deep-research-cli-"));
   const app = dependencies(directory, directReportResponses);
@@ -70,6 +104,7 @@ test("a positional request runs research, prints a run ID, and writes the report
     assert.match(app.stdout, /# Battery recycling/);
     assert.match(app.stdout, /Here is the report\./);
   } finally {
+    await app.close();
     await rm(directory, { recursive: true, force: true });
   }
 });
@@ -90,6 +125,7 @@ test("a clarification question is asked in the terminal and the same run continu
     assert.match(app.questions[0]!, /Which region should I focus on/);
     assert.match(app.stdout, /# Europe battery recycling/);
   } finally {
+    await app.close();
     await rm(directory, { recursive: true, force: true });
   }
 });
@@ -125,6 +161,7 @@ test("an interrupted clarification is re-asked by explicit run ID and the saved 
     assert.equal(listed, 0);
     assert.match(app.stdout, new RegExp(`${runId}\\tcompleted`));
   } finally {
+    await app.close();
     await rm(directory, { recursive: true, force: true });
   }
 });
@@ -159,6 +196,7 @@ test("the supervisor delegates to a durable researcher conversation and passes i
     assert.match(app.stdout, /European recycling is expanding/);
     assert.match(app.stdout, /https:\/\/example\.test\/source/);
   } finally {
+    await app.close();
     await rm(directory, { recursive: true, force: true });
   }
 });
@@ -187,6 +225,7 @@ test("a researcher cannot exceed its persisted Tavily search budget", async () =
     assert.deepEqual(queries, ["first search"]);
     assert.match(app.stdout, /Final report with one source/);
   } finally {
+    await app.close();
     await rm(directory, { recursive: true, force: true });
   }
 });
@@ -214,6 +253,7 @@ test("a researcher hitting its turn limit still contributes partial findings to 
     assert.deepEqual(queries, ["limited search"]);
     assert.match(app.stdout, /Final report with partial findings/);
   } finally {
+    await app.close();
     await rm(directory, { recursive: true, force: true });
   }
 });
@@ -266,6 +306,7 @@ test("a failed researcher does not discard its successful sibling's findings", a
     assert.match(reportPrompts.join("\n"), /Research assignment failed for/);
     assert.match(app.stdout, /discloses a research failure/);
   } finally {
+    await app.close();
     await rm(directory, { recursive: true, force: true });
   }
 });
@@ -282,6 +323,7 @@ test("missing Tavily is reported as a failed saved run before briefing", async (
     assert.equal(await app.run(["list"]), 0);
     assert.match(app.stdout, /failed/);
   } finally {
+    await app.close();
     await rm(directory, { recursive: true, force: true });
   }
 });
@@ -311,6 +353,7 @@ test("research_complete terminates a researcher conversation early", async () =>
     assert.match(compressionPrompts.join("\\n"), /Early findings from the researcher/);
     assert.match(app.stdout, /Final report from early findings/);
   } finally {
+    await app.close();
     await rm(directory, { recursive: true, force: true });
   }
 });
@@ -328,6 +371,7 @@ test("each research run uses its own SQLite file and run ID", async () => {
     assert.match(app.stdout, new RegExp(`${ids[0]}\\tcompleted\\tFirst independent research request`));
     assert.match(app.stdout, new RegExp(`${ids[1]}\\tcompleted\\tSecond independent research request`));
   } finally {
+    await app.close();
     await rm(directory, { recursive: true, force: true });
   }
 });

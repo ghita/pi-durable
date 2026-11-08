@@ -12,13 +12,15 @@ import {
   type Tx,
   UsageDoc,
 } from "@earendil-works/pi-durable";
-import { ResearcherDataDoc, type SearchSource } from "./research-tools.ts";
+import { ResearcherDataDoc } from "./tools/researcher-data.ts";
+import type { SearchSource } from "./tools/types.ts";
 
 export type RunStatus = "queued" | "running" | "awaiting_clarification" | "completed" | "failed";
 export type ClarificationExchange = { question: string; answer: string };
 
 export type RunRecord = {
   runId: string;
+  agentId?: string;
   topic: string;
   status: RunStatus;
   createdAt: number;
