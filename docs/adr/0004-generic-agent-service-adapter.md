@@ -1,0 +1,5 @@
+# Generic agent-service hosting adapter
+
+**Status:** Accepted
+
+The server will keep its own `HostedAgent` protocol boundary rather than adopt the LangGraph API server, because hosted implementations are application services backed by Pi Durable, not compiled LangGraph graphs. Agent entrypoints will provide a shared service contract and descriptor; the catalog will wrap them with one generic host adapter. Each service owns its durable conversation/workflow state, while the host persists thread binding, command-idempotency records, event cursors, and any opaque service identity needed to reconnect. Threads may be single-case or multi-turn; a multi-turn thread has one run at a time, each new `run.start` after a terminal run starts a new turn, and `input.respond` resumes the interrupted run. Services expose full run snapshots (status, progress, pending inputs, output, or error), with pending inputs answered individually and optional domain events. Command handling remains idempotent by command ID. Cancellation is out of scope for v1: disconnecting the CLI leaves durable work running for later resume.

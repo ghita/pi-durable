@@ -26,6 +26,7 @@ export type RunRecord = {
   createdAt: number;
   updatedAt: number;
   coordinatorTaskId?: TaskId<CoordinatorResult>;
+  clarificationCommands?: Record<string, { answer: string; interruptId?: string }>;
   config?: ResearchConfig;
   clarificationHistory: ClarificationExchange[];
   pendingQuestion?: string;

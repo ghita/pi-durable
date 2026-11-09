@@ -7,7 +7,8 @@
     "node": ">=22.19.0"
   },
   "bin": {
-    "deep-research": "dist/cli.js"
+    "deep-research": "dist/cli.js",
+    "agent-server": "dist/agent-server/cli.js"
   },
   "main": "./dist/index.js",
   "types": "./dist/index.d.ts",
@@ -15,12 +16,17 @@
     ".": {
       "types": "./dist/index.d.ts",
       "import": "./dist/index.js"
+    },
+    "./agent-server": {
+      "types": "./dist/agent-server/index.d.ts",
+      "import": "./dist/agent-server/index.js"
     }
   },
   "scripts": {
     "build": "tsc -p tsconfig.build.json",
     "cli": "node --experimental-strip-types src/cli.ts",
-    "test": "node --experimental-strip-types --test test/*.test.ts",
+    "server": "npm run build && node dist/agent-server/cli.js",
+    "test": "node --test-concurrency=1 --experimental-strip-types --test test/*.test.ts",
     "typecheck": "tsc --noEmit -p tsconfig.json"
   },
   "dependencies": {
@@ -28,6 +34,7 @@
     "@earendil-works/pi-ai": "1.5.0",
     "@earendil-works/pi-durable": "1.5.0",
     "@earendil-works/pi-schema": "1.5.0",
+    "@langchain/protocol": "0.0.21",
     "dotenv": "^16.6.1"
   },
   "devDependencies": {

@@ -8,10 +8,19 @@ import type { AssistantMessage } from "@earendil-works/pi-ai";
 import { createModels } from "@earendil-works/pi-ai/models";
 import { fauxAssistantMessage, fauxProvider, fauxText, fauxToolCall, type FauxResponseFactory, type FauxResponseStep } from "@earendil-works/pi-ai/providers/faux";
 import { runCli } from "../src/cli-adapter.ts";
+import { AgentServerClient } from "../src/agent-server/client.ts";
+import { createAgentServer } from "../src/agent-server/server.ts";
+import { createResearchHostedAgent } from "../src/agent-server/research-adapter.ts";
+import { createHostedAgentAdapter } from "../src/agent-server/host-adapter.ts";
+import { createSimpleChatAgentService } from "../src/agent-server/simple-chat.ts";
 import { createResearchRunAgent } from "../src/research-run-agent.ts";
 
 type SearchSource = { title: string; url: string; content: string; query: string };
 type Search = (query: string) => Promise<{ ok: true; results: SearchSource[] }>;
+
+function researchArgs(request: string): string[] {
+  return ["run", "--agent", "deep-research", "--input-json", JSON.stringify({ request })];
+}
 
 function dependencies(
   directory: string,
@@ -29,6 +38,7 @@ function dependencies(
   let stderr = "";
   const questions: string[] = [];
   let agentPromise: ReturnType<typeof createResearchRunAgent> | undefined;
+  let serverPromise: Promise<{ server: ReturnType<typeof createAgentServer>; client: AgentServerClient }> | undefined;
   const getAgent = () => agentPromise ??= createResearchRunAgent({
     cwd: directory,
     context: BACKGROUND_CONTEXT,
@@ -36,18 +46,47 @@ function dependencies(
     model: { provider: "faux", modelId: "faux-1" },
     search: (query) => search(query),
     searchConfigured,
+    recoverOnStart: false,
     env,
   });
+  const getClient = async () => {
+    serverPromise ??= (async () => {
+      const hosted = createResearchHostedAgent({ agent: await getAgent() });
+      const simpleChat = createHostedAgentAdapter(createSimpleChatAgentService({
+        cwd: directory,
+        dataDirectory: join(directory, "simple-chat"),
+        models,
+        model: { provider: "faux", modelId: "faux-1" },
+      }));
+      const server = createAgentServer({
+        agents: [hosted, simpleChat],
+        token: "integration-test-server-token",
+        host: "127.0.0.1",
+        port: 0,
+        statePath: join(directory, "agent-server-state.json"),
+      });
+      const address = await server.listen();
+      return {
+        server,
+        client: new AgentServerClient({ baseUrl: `http://127.0.0.1:${address.port}`, token: "integration-test-server-token" }),
+      };
+    })();
+    return (await serverPromise).client;
+  };
   return {
     models,
     faux,
     questions,
     getAgent,
+    getClient,
     get stdout() { return stdout; },
     get stderr() { return stderr; },
-    close: async () => { if (agentPromise) await (await agentPromise).close(); },
+    close: async () => {
+      if (serverPromise) await (await serverPromise).server.close();
+      else if (agentPromise) await (await agentPromise).close();
+    },
     run: async (args: string[], answer = defaultAnswer) => runCli(args, {
-      agent: await getAgent(),
+      client: await getClient(),
       io: {
         stdout: (text) => { stdout += text; },
         stderr: (text) => { stderr += text; },
@@ -94,15 +133,68 @@ test("ResearchRunAgent accepts work asynchronously and watches high-level progre
   }
 });
 
-test("a positional request runs research, prints a run ID, and writes the report", async () => {
+test("the CLI runs the selected agent over HTTP and prints its report", async () => {
   const directory = await mkdtemp(join(tmpdir(), "deep-research-cli-"));
   const app = dependencies(directory, directReportResponses);
   try {
-    const exitCode = await app.run(["Research current battery recycling methods"]);
+    const exitCode = await app.run(researchArgs("Research current battery recycling methods"));
     assert.equal(exitCode, 0);
-    assert.match(app.stderr, /Run ID: [0-9a-f-]+/i);
+    assert.match(app.stderr, /Thread ID: [0-9a-f-]+/i);
     assert.match(app.stdout, /# Battery recycling/);
     assert.match(app.stdout, /Here is the report\./);
+  } finally {
+    await app.close();
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("CLI discovers server agents and accepts explicit protocol JSON input", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "deep-research-cli-protocol-input-"));
+  const app = dependencies(directory, directReportResponses);
+  try {
+    assert.equal(await app.run(["agents"]), 0);
+    assert.match(app.stdout, /deep-research\tDeep Research/);
+    assert.equal(await app.run(["run", "--agent", "deep-research", "--input-json", '{"request":"Research battery recycling"}']), 0, app.stderr);
+    assert.match(app.stdout, /# Battery recycling/);
+  } finally {
+    await app.close();
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("CLI chat runs successive JSON turns on one thread for a multi-turn agent", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "multi-turn-cli-chat-"));
+  const app = dependencies(directory, ["First chat answer.", "Second chat answer."]);
+  const prompts: string[] = [];
+  let turn = 0;
+  try {
+    const exitCode = await app.run(
+      ["chat", "--agent", "simple-chat", "--input-json", JSON.stringify({ message: "hello" })],
+      async (prompt) => {
+        prompts.push(prompt);
+        turn += 1;
+        return turn === 1 ? JSON.stringify({ message: "follow up" }) : "";
+      },
+    );
+    assert.equal(exitCode, 0, app.stderr);
+    assert.equal(prompts.length, 2, "the CLI should prompt after each terminal turn, until blank input exits");
+    assert.match(prompts[0]!, /Next turn for simple-chat as JSON/);
+    assert.match(app.stderr, /Interactive session started/);
+    assert.match(app.stdout, /First chat answer/);
+    assert.match(app.stdout, /Second chat answer/);
+  } finally {
+    await app.close();
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("CLI does not infer a default agent from positional request text", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "deep-research-cli-no-default-agent-"));
+  const app = dependencies(directory, []);
+  try {
+    assert.equal(await app.run(["Research current battery recycling methods"]), 2);
+    assert.match(app.stderr, /--agent <agent-id>/);
+    assert.match(app.stderr, /--input-json/);
   } finally {
     await app.close();
     await rm(directory, { recursive: true, force: true });
@@ -119,7 +211,7 @@ test("a clarification question is asked in the terminal and the same run continu
     "# Europe battery recycling\n\nThe report.",
   ]);
   try {
-    const exitCode = await app.run(["Research battery recycling"]);
+    const exitCode = await app.run(researchArgs("Research battery recycling"));
     assert.equal(exitCode, 0);
     assert.equal(app.questions.length, 1);
     assert.match(app.questions[0]!, /Which region should I focus on/);
@@ -130,31 +222,36 @@ test("a clarification question is asked in the terminal and the same run continu
   }
 });
 
-test("an interrupted clarification is re-asked by explicit run ID and the saved run completes", async () => {
+test("an interrupted clarification is re-asked by explicit thread ID and the saved run completes", async () => {
   const directory = await mkdtemp(join(tmpdir(), "deep-research-resume-"));
   const app = dependencies(directory, [
     '{"needClarification":true,"question":"Which region should I focus on?","verification":""}',
+    '{"needClarification":true,"question":"Which time period should I cover?","verification":"Europe"}',
   ]);
   try {
-    const interrupted = await app.run(["Research battery recycling"], async () => {
+    const interrupted = await app.run(researchArgs("Research battery recycling"), async (question) => {
+      if (question.includes("Which region")) return "Europe";
       const error = new Error("terminal interrupted");
       error.name = "AbortError";
       throw error;
     });
     assert.equal(interrupted, 130);
-    const runId = /Run ID: ([0-9a-f-]+)/i.exec(app.stderr)?.[1];
+    const runId = /Thread ID: ([0-9a-f-]+)/i.exec(app.stderr)?.[1];
     assert.ok(runId);
+    assert.equal(app.questions.length, 2);
 
     app.faux.appendResponses([
-      fauxAssistantMessage([fauxText('{"needClarification":false,"question":"","verification":"Europe"}')]),
-      fauxAssistantMessage([fauxText("A Europe-focused brief.")]),
+      fauxAssistantMessage([fauxText('{"needClarification":false,"question":"","verification":"2020-2024"}')]),
+      fauxAssistantMessage([fauxText("A Europe-focused brief for 2020-2024.")]),
       fauxAssistantMessage([fauxText('{"sufficient":true,"assignments":[]}')]),
       fauxAssistantMessage([fauxText("# Europe battery recycling\n\nThe saved run resumed.")]),
     ]);
-    const resumed = await app.run(["resume", runId], async () => "Europe");
-    assert.equal(resumed, 0);
-    assert.equal(app.questions.length, 2);
-    assert.match(app.questions[1]!, /Which region should I focus on/);
+    const resumed = await app.run(["resume", runId], async () => "Focus on 2020-2024.");
+    assert.equal(resumed, 0, app.stderr);
+    assert.equal(app.questions.length, 3);
+    assert.match(app.questions[0]!, /Which region should I focus on/);
+    assert.match(app.questions[1]!, /Which time period should I cover/);
+    assert.match(app.questions[2]!, /Which time period should I cover/);
     assert.match(app.stdout, /The saved run resumed\./);
 
     const listed = await app.run(["list"]);
@@ -190,7 +287,7 @@ test("the supervisor delegates to a durable researcher conversation and passes i
     MAX_SEARCHES_PER_RESEARCHER: "2",
   });
   try {
-    const exitCode = await app.run(["Research battery recycling in Europe"]);
+    const exitCode = await app.run(researchArgs("Research battery recycling in Europe"));
     assert.equal(exitCode, 0, app.stderr);
     assert.deepEqual(queries, ["European battery recycling"]);
     assert.match(app.stdout, /European recycling is expanding/);
@@ -221,7 +318,7 @@ test("a researcher cannot exceed its persisted Tavily search budget", async () =
     MAX_SEARCHES_PER_RESEARCHER: "1",
   });
   try {
-    assert.equal(await app.run(["Research the topic"]), 0, app.stderr);
+    assert.equal(await app.run(researchArgs("Research the topic")), 0, app.stderr);
     assert.deepEqual(queries, ["first search"]);
     assert.match(app.stdout, /Final report with one source/);
   } finally {
@@ -249,7 +346,7 @@ test("a researcher hitting its turn limit still contributes partial findings to 
     MAX_SEARCHES_PER_RESEARCHER: "4",
   });
   try {
-    assert.equal(await app.run(["Research the topic"]), 0, app.stderr);
+    assert.equal(await app.run(researchArgs("Research the topic")), 0, app.stderr);
     assert.deepEqual(queries, ["limited search"]);
     assert.match(app.stdout, /Final report with partial findings/);
   } finally {
@@ -300,7 +397,7 @@ test("a failed researcher does not discard its successful sibling's findings", a
     MAX_SEARCHES_PER_RESEARCHER: "2",
   });
   try {
-    assert.equal(await app.run(["Research two related topics"]), 0, app.stderr);
+    assert.equal(await app.run(researchArgs("Research two related topics")), 0, app.stderr);
     assert.deepEqual(queries, ["successful sibling query"]);
     assert.match(compressionPrompts.join("\n"), /Successful researcher found a relevant recycling program/);
     assert.match(reportPrompts.join("\n"), /Research assignment failed for/);
@@ -317,7 +414,7 @@ test("missing Tavily is reported as a failed saved run before briefing", async (
     '{"needClarification":false,"question":"","verification":""}',
   ], undefined, undefined, {}, false);
   try {
-    const exitCode = await app.run(["Research without a search key"]);
+    const exitCode = await app.run(researchArgs("Research without a search key"));
     assert.equal(exitCode, 1);
     assert.match(app.stderr, /TAVILY_API_KEY/);
     assert.equal(await app.run(["list"]), 0);
@@ -349,7 +446,7 @@ test("research_complete terminates a researcher conversation early", async () =>
     MAX_SEARCHES_PER_RESEARCHER: "2",
   });
   try {
-    assert.equal(await app.run(["Research the topic"]), 0, app.stderr);
+    assert.equal(await app.run(researchArgs("Research the topic")), 0, app.stderr);
     assert.match(compressionPrompts.join("\\n"), /Early findings from the researcher/);
     assert.match(app.stdout, /Final report from early findings/);
   } finally {
@@ -362,14 +459,14 @@ test("each research run uses its own SQLite file and run ID", async () => {
   const directory = await mkdtemp(join(tmpdir(), "deep-research-isolation-"));
   const app = dependencies(directory, [...directReportResponses, ...directReportResponses]);
   try {
-    assert.equal(await app.run(["First independent research request"]), 0);
-    assert.equal(await app.run(["Second independent research request"]), 0);
-    const ids = [...app.stderr.matchAll(/Run ID: ([0-9a-f-]+)/gi)].map((match) => match[1]);
+    assert.equal(await app.run(researchArgs("First independent research request")), 0);
+    assert.equal(await app.run(researchArgs("Second independent research request")), 0);
+    const ids = [...app.stderr.matchAll(/Thread ID: ([0-9a-f-]+)/gi)].map((match) => match[1]);
     assert.equal(ids.length, 2);
     assert.notEqual(ids[0], ids[1]);
     assert.equal(await app.run(["list"]), 0);
-    assert.match(app.stdout, new RegExp(`${ids[0]}\\tcompleted\\tFirst independent research request`));
-    assert.match(app.stdout, new RegExp(`${ids[1]}\\tcompleted\\tSecond independent research request`));
+    assert.match(app.stdout, new RegExp(`${ids[0]}\\tcompleted\\tdeep-research\\tFirst independent research request`));
+    assert.match(app.stdout, new RegExp(`${ids[1]}\\tcompleted\\tdeep-research\\tSecond independent research request`));
   } finally {
     await app.close();
     await rm(directory, { recursive: true, force: true });

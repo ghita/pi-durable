@@ -1,0 +1,7 @@
+{
+  "agents": {
+    "deep-research": "./dist/agent-server/research-adapter.js:createResearchAgentFromManifest",
+    "simple-chat": "./dist/agent-server/simple-chat.js:createSimpleChatAgentFromManifest"
+  },
+  "env": ".env"
+}

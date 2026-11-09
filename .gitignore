@@ -4,6 +4,8 @@ dist/
 .env.*
 !.env.example
 .deep-research/
+.agent-server/
+agent-server.json
 *.sqlite
 *.sqlite-shm
 *.sqlite-wal

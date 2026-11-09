@@ -43,11 +43,11 @@ export type ResearchAgentDescriptor = { id: string; name: string; description: s
 
 export interface ResearchRunAgent {
   listAgents(): Promise<ResearchAgentDescriptor[]>;
-  start(input: { agentId: string; request: string }): Promise<ResearchRunSnapshot>;
+  start(input: { agentId: string; request: string; runId?: RunId }): Promise<ResearchRunSnapshot>;
   get(runId: RunId): Promise<ResearchRunSnapshot | undefined>;
   listRuns(): Promise<ResearchRunSnapshot[]>;
   resume(runId: RunId): Promise<ResearchRunSnapshot>;
-  answerClarification(runId: RunId, answer: string): Promise<ResearchRunSnapshot>;
+  answerClarification(runId: RunId, answer: string, commandId?: string, interruptId?: string, expectedUpdatedAt?: number): Promise<ResearchRunSnapshot>;
   watch(runId: RunId): AsyncIterable<ResearchRunSnapshot>;
   close(): Promise<void>;
 }
@@ -134,7 +134,7 @@ function snapshotKey(snapshot: ResearchRunSnapshot): string {
 
 async function persistCoordinatorTask(
   harness: Harness,
-  start: { kind: "new"; runId: RunId; topic: string; config: ResearchConfig } | { kind: "answer"; runId: RunId; answer: string },
+  start: { kind: "new"; runId: RunId; topic: string; config: ResearchConfig } | { kind: "answer"; runId: RunId; answer: string; commandId?: string; interruptId?: string; expectedUpdatedAt?: number },
   context: Context,
 ): Promise<TaskId<CoordinatorResult>> {
   const root = start.kind === "new"
@@ -146,6 +146,15 @@ async function persistCoordinatorTask(
     let config: ResearchConfig;
     let history: ClarificationExchange[];
     const initial = start.kind === "new";
+
+    if (!initial && start.commandId) {
+      const accepted = run.clarificationCommands?.[start.commandId];
+      if (accepted) {
+        if (accepted.answer !== start.answer || (start.interruptId !== undefined && accepted.interruptId !== start.interruptId)) throw new ResearchRunStateError("Clarification command ID was already used with a different response.");
+        if (!run.coordinatorTaskId) throw new ResearchRunStateError("Accepted clarification has no saved coordinator task.");
+        return run.coordinatorTaskId;
+      }
+    }
 
     if (initial) {
       topic = start.topic;
@@ -159,10 +168,19 @@ async function persistCoordinatorTask(
       if (run.status !== "awaiting_clarification" || !run.pendingQuestion) {
         throw new ResearchRunStateError(`Run ${start.runId} is not awaiting clarification.`);
       }
+      if (start.expectedUpdatedAt !== undefined && run.updatedAt !== start.expectedUpdatedAt) {
+        throw new ResearchRunStateError("Clarification interrupt is stale or does not belong to this pending question.");
+      }
       if (!run.config) throw new ResearchRunStateError(`Run ${start.runId} has no saved configuration.`);
       topic = run.topic;
       config = run.config;
       history = [...run.clarificationHistory, { question: run.pendingQuestion, answer: start.answer }];
+      if (start.commandId) {
+        run.clarificationCommands ??= {};
+        run.clarificationCommands[start.commandId] = { answer: start.answer, ...(start.interruptId ? { interruptId: start.interruptId } : {}) };
+        const keys = Object.keys(run.clarificationCommands);
+        for (const key of keys.slice(0, Math.max(0, keys.length - 1000))) delete run.clarificationCommands[key];
+      }
     }
 
     run.status = "running";
@@ -252,13 +270,19 @@ class DurableResearchRunAgent implements ResearchRunAgent {
     return AGENTS.map((agent) => ({ ...agent }));
   }
 
-  async start(input: { agentId: string; request: string }): Promise<ResearchRunSnapshot> {
+  async start(input: { agentId: string; request: string; runId?: RunId }): Promise<ResearchRunSnapshot> {
     this.#assertOpen();
     if (input.agentId !== DEEP_RESEARCH_AGENT_ID) throw new ResearchAgentNotFoundError(input.agentId);
     const topic = input.request.trim();
     if (!topic) throw new Error("Research request must not be empty.");
 
-    const runId = randomUUID();
+    const runId = input.runId ?? randomUUID();
+    if (!RUN_ID_PATTERN.test(runId)) throw new ResearchRunStateError(`Invalid run ID: ${runId}`);
+    const existing = await this.get(runId);
+    if (existing) {
+      if (existing.agentId === input.agentId && existing.request === topic) return existing;
+      throw new ResearchRunStateError(`Run ID ${runId} is already bound to another request.`);
+    }
     await mkdir(this.#runDirectory, { recursive: true });
     const harness = await this.#openHarness(join(this.#runDirectory, `${runId}.sqlite`));
     try {
@@ -343,10 +367,17 @@ class DurableResearchRunAgent implements ResearchRunAgent {
     return (await this.get(runId)) ?? snapshot;
   }
 
-  async answerClarification(runId: RunId, answer: string): Promise<ResearchRunSnapshot> {
+  async answerClarification(runId: RunId, answer: string, commandId?: string, interruptId?: string, expectedUpdatedAt?: number): Promise<ResearchRunSnapshot> {
     this.#assertOpen();
     const initial = await this.get(runId);
     if (!initial) throw new ResearchRunNotFoundError(runId);
+    if (commandId) {
+      const accepted = await this.#acceptedClarification(runId, commandId);
+      if (accepted) {
+        if (accepted.answer !== answer || (interruptId !== undefined && accepted.interruptId !== interruptId)) throw new ResearchRunStateError("Clarification command ID was already used with a different response.");
+        return (await this.get(runId)) ?? initial;
+      }
+    }
     if (initial.status !== "awaiting_clarification") {
       throw new ResearchRunStateError(`Run ${runId} is not awaiting clarification.`);
     }
@@ -361,7 +392,7 @@ class DurableResearchRunAgent implements ResearchRunAgent {
 
     const harness = await this.#openHarness(join(this.#runDirectory, `${runId}.sqlite`));
     try {
-      const taskId = await persistCoordinatorTask(harness, { kind: "answer", runId, answer }, this.#dependencies.context);
+      const taskId = await persistCoordinatorTask(harness, { kind: "answer", runId, answer, ...(commandId ? { commandId } : {}), ...(interruptId ? { interruptId } : {}), ...(expectedUpdatedAt !== undefined ? { expectedUpdatedAt } : {}) }, this.#dependencies.context);
       const record = await harness.snapshot(RunDoc, this.#dependencies.context);
       if (!record) throw new Error(`Run database ${runId} has no research state.`);
       const snapshot = toSnapshot(record);
@@ -470,7 +501,28 @@ class DurableResearchRunAgent implements ResearchRunAgent {
     }
   }
 
+  async #acceptedClarification(runId: RunId, commandId: string): Promise<{ answer: string; interruptId?: string } | undefined> {
+    const active = this.#active.get(runId);
+    if (active) {
+      const record = await active.harness.snapshot(RunDoc, this.#dependencies.context);
+      return record?.clarificationCommands?.[commandId];
+    }
+    const path = join(this.#runDirectory, `${runId}.sqlite`);
+    try { await access(path); } catch { return undefined; }
+    const harness = await this.#openHarness(path, true);
+    try {
+      const record = await harness.snapshot(RunDoc, this.#dependencies.context);
+      return record?.clarificationCommands?.[commandId];
+    } finally {
+      await harness.close(this.#dependencies.context).catch(() => {});
+    }
+  }
+
   #launch(runId: RunId, harness: Harness, taskId: TaskId<CoordinatorResult>): void {
+    if (this.#active.has(runId)) {
+      void harness.close(this.#dependencies.context).catch(() => {});
+      return;
+    }
     const active: ActiveRun = { harness, done: Promise.resolve() };
     this.#active.set(runId, active);
     active.done = this.#drive(runId, active, taskId);

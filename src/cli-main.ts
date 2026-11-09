@@ -1,5 +1,5 @@
 import "dotenv/config";
-import { createResearchRunAgent } from "./research-run-agent.ts";
+import { AgentServerClient } from "./agent-server/client.ts";
 import { runCli } from "./cli-adapter.ts";
 
 async function ask(question: string): Promise<string> {
@@ -23,24 +23,23 @@ async function ask(question: string): Promise<string> {
 }
 
 export async function main(): Promise<void> {
-  let agent: Awaited<ReturnType<typeof createResearchRunAgent>> | undefined;
-  let exitCode = 1;
-  try {
-    agent = await createResearchRunAgent({ recoverOnStart: false });
-    exitCode = await runCli(process.argv.slice(2), {
-      agent,
-      io: {
-        stdout: (text) => process.stdout.write(text),
-        stderr: (text) => process.stderr.write(text),
-        ask,
-      },
-    });
-  } catch (error) {
-    process.stderr.write(`${error instanceof Error ? error.message : String(error)}\n`);
-  } finally {
-    if (agent) await agent.close().catch((error: unknown) => {
-      process.stderr.write(`Could not close research service: ${error instanceof Error ? error.message : String(error)}\n`);
-    });
+  const args = process.argv.slice(2);
+  if (!process.env.AGENT_SERVER_TOKEN && !args.some((argument) => argument === "--help" || argument === "-h")) {
+    process.stderr.write("Set AGENT_SERVER_TOKEN in .env or the environment to use the HTTP agent server.\n");
+    process.exitCode = 1;
+    return;
   }
-  process.exitCode = exitCode;
+
+  const client = new AgentServerClient({
+    baseUrl: process.env.AGENT_SERVER_URL ?? "http://127.0.0.1:3000",
+    token: process.env.AGENT_SERVER_TOKEN ?? "",
+  });
+  process.exitCode = await runCli(args, {
+    client,
+    io: {
+      stdout: (text) => process.stdout.write(text),
+      stderr: (text) => process.stderr.write(text),
+      ask,
+    },
+  });
 }

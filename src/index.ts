@@ -1,3 +1,5 @@
+export * from "./agent-server/index.ts";
+
 export {
   createResearchRunAgent,
   DEEP_RESEARCH_AGENT_ID,
